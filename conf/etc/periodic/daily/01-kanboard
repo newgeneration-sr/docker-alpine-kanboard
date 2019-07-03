@@ -1,0 +1,11 @@
+#!/bin/sh
+
+run(){
+    eval "su - nginx -s /bin/ash -c 'cd /var/www/kanboard/ && "$@"'" 
+    return $? 
+}
+
+if [ -f /tmp/kanboard_configured ] && [ $(cat /tmp/kanboard_configured) -eq 0 ]
+then
+    run ./cli cronjob
+fi

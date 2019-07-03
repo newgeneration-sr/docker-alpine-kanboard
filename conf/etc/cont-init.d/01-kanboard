@@ -1,0 +1,215 @@
+#!/usr/bin/with-contenv sh
+
+run(){
+  eval "su - nginx -s /bin/ash -c 'cd /var/www/kanboard/ && "$@"'" 
+  return $? 
+}
+
+wait_db(){
+    echo ">>> Waiting for database to be ready"
+    while ! $(nc -vz ${DATABASE_HOST} ${DATABASE_PORT})
+    do
+        sleep 1
+    done
+    echo ">>> Database ready"
+}
+
+do_query(){
+    echo $1 > /tmp/cmd
+    /usr/bin/mysql -h ${DATABASE_HOST} -P ${DATABASE_PORT} -u ${DATABASE_USERNAME} ${DATABASE_NAME} --password=${DATABASE_PASSWORD} </tmp/cmd 
+    RET=$?
+    rm /tmp/cmd
+    return $RET
+}
+
+check_configured(){
+    OUT=$(do_query "SELECT 1 FROM __configured;" 2>&1)
+    RET=$?
+
+    [ $RET -eq 1 ] && echo "$OUT" | grep 1146 >/dev/null
+    [ $? -eq 1 ]
+    CONFIGURED=$?
+
+    [ $RET -eq 1 -a $CONFIGURED -eq 0 ]
+    DB_PROBLEM=$?
+}
+
+add_configured(){
+    do_query "CREATE TABLE __configured(a INT NOT NULL AUTO_INCREMENT PRIMARY KEY);"
+}
+
+switch_nginx_conf(){
+    mv /etc/nginx/conf.d/kanboard* /opt/ressources/nginx/conf.d/ 2>/dev/null
+
+    filename=""
+    [ $1 ] && filename="-$1"
+
+    mv "/opt/ressources/nginx/conf.d/kanboard$filename.conf" /etc/nginx/conf.d/
+}
+
+replace_key() {
+    sed -Ei -e "s/(.*$1', )null(.*)/\1''\2/" \
+            -e "s/(.*$1', '?)[^ ');]*(.*)/\1$2\2/" /var/www/kanboard/config.php
+}
+
+install(){
+    echo "> Install"
+    if [ ! -d /var/www/kanboard ] 
+    then
+        echo ">>> No volume mounted"
+        echo ">>>>> Creating working dir"
+        mkdir -p /var/www/kanboard
+    fi
+
+    if [ ! -d /var/www/error ]
+    then
+        echo ">>> Creating static web error pages"
+        mkdir -p /var/www/error
+        mv /opt/ressources/www/error/*.html /var/www/error/ 2>/dev/null
+
+        chown nginx:nginx /var/www/error -R
+    fi
+
+    ls /var/www/kanboard/index.php >/dev/null 2>&1
+    INSTALLED=$?
+
+    wait_db
+    check_configured
+
+    echo "INSTALLED = $INSTALLED and CONFIGURED = $CONFIGURED"
+
+    if [ $DB_PROBLEM -eq 0 ]
+    then
+        echo ">>> Problem detected, can't connect to database"
+        echo "Query answer: $OUT"
+        switch_nginx_conf db_error
+        success
+    fi
+
+    if [ ! $INSTALLED -eq 0 ]
+    then
+        if [ ! $CONFIGURED -eq 0 ]
+        then
+            VERSION=$(wget -q -O - https://api.github.com/repos/kanboard/kanboard/tags \
+            | grep "name" | cut -d '"' -f4 | sed -e 's/v//g' | head -n 1)
+
+            echo ">>> Downloading $VERSION"
+            wget https://github.com/kanboard/kanboard/archive/v$VERSION.zip \
+            -O /tmp/kanboard-${VERSION}.zip ||  return 1 
+
+            echo ">>> Unzipping "
+            unzip -q /tmp/kanboard-${VERSION}.zip -d /var/www/ ||  return 1
+            mv /var/www/kanboard-${VERSION}/* /var/www/kanboard || return 1
+
+            rm -rf /var/www/kanboard-${VERSION}
+            rm /tmp/kanboard-${VERSION}.zip 
+
+            echo ">>> Fixing permissions"
+            chown nginx:nginx /var/www/kanboard -R
+        else
+            echo ">>> Problem detected, hanging database with no installation"
+            switch_nginx_conf hanging_db
+            success
+        fi
+    else
+        if [ ! $CONFIGURED -eq 0 ]
+        then
+            echo ">>> Problem detected, already installed but the database was dropped"
+            switch_nginx_conf db_dropped
+            success
+        else
+            echo ">>> Already installed"
+        fi
+    fi
+
+    return 0
+}
+
+check_language() {
+    for lang in $(ls /var/www/kanboard/app/Locale)
+    do
+        [ "$lang" = "$1" ] && return 0
+    done
+
+    return 1
+}
+
+config(){
+    echo "> Config"
+
+    if [ ! $CONFIGURED -eq 0 ]
+    then 
+        echo ">>> Configuring"
+        cp /var/www/kanboard/config.default.php /var/www/kanboard/config.php
+
+        replace_key DB_DRIVER mysql
+        replace_key DB_USERNAME ${DATABASE_USERNAME}
+        replace_key DB_PASSWORD ${DATABASE_PASSWORD}
+        replace_key DB_HOSTNAME ${DATABASE_HOST}:${DATABASE_PORT}
+        replace_key DB_NAME ${DATABASE_NAME}
+
+        if [ ${USE_LDAP} = "TRUE" ]
+        then
+            echo ">>>>> Configuring LDAP auth"
+            replace_key LDAP_AUTH true
+
+            replace_key LDAP_BIND_TYPE "proxy"
+            replace_key LDAP_USERNAME "cn=admin,${LDAP_BASE_DN}"
+            replace_key LDAP_PASSWORD "${LDAP_ADMIN_PASS}"
+
+            replace_key LDAP_SERVER ${LDAP_HOST}
+
+            replace_key LDAP_USER_BASE_DN ${LDAP_BASE_DN}
+            replace_key LDAP_USER_FILTER "uid=%s"
+
+            replace_key LDAP_ACCOUNT_CREATION false
+            replace_key LDAP_GROUP_BASE_DN "ou=groups,${LDAP_BASE_DN}"
+            replace_key LDAP_GROUP_ADMIN_DN "cn=${LDAP_ADMIN_GROUP},ou=groups,${LDAP_BASE_DN}"
+        fi
+
+        echo ">>>>> Importing database"
+        /usr/bin/mysql -h ${DATABASE_HOST} -P ${DATABASE_PORT} -u ${DATABASE_USERNAME} ${DATABASE_NAME} \
+        --password=${DATABASE_PASSWORD} </opt/ressources/mysql.sql
+
+        rm /opt/ressources/mysql.sql
+
+        echo ">>>>> Changing admin password"
+        mv /opt/ressources/chpwd.php /var/www/kanboard
+        php /var/www/kanboard/chpwd.php "${ADMIN_PASSWORD}"
+
+        if check_language "${APP_LANGUAGE}"
+        then
+            echo ">>>>> Changing application language to ${APP_LANGUAGE}"
+            QUERY="UPDATE settings SET value = '${APP_LANGUAGE}' WHERE option = 'application_language'"
+            do_query "$QUERY"
+        else
+            echo ">>>>> Application language ${APP_LANGUAGE} not found, leaving default language"
+            echo "List of languages available = $(ls /var/www/kanboard/app/Locale)"
+        fi
+
+        add_configured
+    else
+        echo ">>> Already Configured"
+    fi
+    
+    echo ">>> Switching to kanboard nginx conf"
+    switch_nginx_conf
+
+    echo 0 > /tmp/kanboard_configured
+
+    return 0
+}
+
+fail(){
+    echo "[ Failed ]"
+    echo "1" > /tmp/kanboard
+    exit 1
+}
+
+success(){
+    echo "[ Success ]"
+    echo "0" > /tmp/kanboard
+    exit 0
+}
+
+install && config && success || fail
