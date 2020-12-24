@@ -1,6 +1,6 @@
 ![docker build automated](https://img.shields.io/docker/cloud/automated/dotriver/kanboard)
 ![docker build status](https://img.shields.io/docker/cloud/build/dotriver/kanboard)
-![docker build status](https://img.shields.io/docker/cloud/pulls/dotriver/kanboard)
+![docker build status](https://img.shields.io/docker/pulls/dotriver/kanboard)
 
 # Kanboard on Alpine Linux + S6 Overlay
 
